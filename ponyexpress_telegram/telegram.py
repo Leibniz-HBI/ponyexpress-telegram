@@ -22,17 +22,17 @@ message_paths = {
     "from_author": ".//span[@class='tgme_widget_message_from_author']/descendant-or-self::*/text()",
     "text": "./div[contains(@class, 'tgme_widget_message_text')]/descendant-or-self::*/text()",
     "link": ".//div[contains(@class, 'tgme_widget_message_text')]//a/@href",
-    #       "reply_to_user" : ".//a[@class='tgme_widget_message_reply']//span[@class='tgme_widget_message_author_name'/descendant-or-self::*/text()]",
-    #       "reply_to_text" : ".//a[@class='tgme_widget_message_reply']//div[@class='tgme_widget_message_text']/descendant-or-self::*/text()",
-    #       "reply_to_link" : ".//a[@class='tgme_widget_message_reply']/@href",
+    "reply_to_user" : ".//a[@class='tgme_widget_message_reply']//span[@class='tgme_widget_message_author_name'/descendant-or-self::*/text()]",
+    "reply_to_text" : ".//a[@class='tgme_widget_message_reply']//div[@class='tgme_widget_message_text']/descendant-or-self::*/text()",
+    "reply_to_link" : ".//a[@class='tgme_widget_message_reply']/@href",
     "image_url": "./a[contains(@class, 'tgme_widget_message_photo_wrap')]/@style",
     "forwarded_message_url": ".//a[@class='tgme_widget_message_forwarded_from_name']/@href",
     "forwarded_message_user": ".//a[@class='tgme_widget_message_forwarded_from_name']/descendant-or-self::*/text()",
     #       "poll_question" : ".//div[@class='tgme_widget_message_poll_question']/descendant-or-self::*/text()",
     #       "poll_options_text" : ".//div[@class='tgme_widget_message_poll_option_value']/descendant-or-self::*/text()",
     #       "poll_options_percent" : ".//div[@class='tgme_widget_message_poll_option_percent']/descendant-or-self::*/text()",
-    #       "video_url" : ".//video[contains(@class, 'tgme_widget_message_video')]/@src",
-    #       "video_duration" : ".//time[contains(@class, 'message_video_duration')]/descendant-or-self::*/text()"
+    "video_url" : ".//video[contains(@class, 'tgme_widget_message_video')]/@src",
+    "video_duration" : ".//time[contains(@class, 'message_video_duration')]/descendant-or-self::*/text()"
 }
 
 
@@ -153,12 +153,10 @@ def telegram_connector(node_names: List[str]) -> Tuple[pd.DataFrame, pd.DataFram
     That is, if there is a public channel present for the specified handles.
 
     Args:
-      node_names: List[str]:  list of handles to scrape
+      node_names:  list of handles to scrape
 
     Returns:
-
      edges, nodes in a Tuple[pd.DataFrame, pd.DataFrame].
-
     """
 
     def get_node(node_name: str) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
@@ -178,10 +176,11 @@ def telegram_connector(node_names: List[str]) -> Tuple[pd.DataFrame, pd.DataFram
             #     log.warning(f"Parsing failed for {node_name}")
             #     return None
             if len(messages) > 0:
-                edges = messages.loc[~messages["forwarded_message_url"].isnull(), :]
+                edges = messages.loc[~messages["forwarded_message_url"].isnull(), :].copy()
+
                 if len(edges) > 0:
-                    edges["source"] = edges["handle"]
-                    edges["target"] = edges["forwarded_message_url"].str.extract(
+                    edges.loc[:, "source"] = edges.loc[:, "handle"]
+                    edges.loc[:, "target"] = edges.forwarded_message_url.str.extract(
                         r"([\w_]+)(?=\/\d+)"
                     )
 
@@ -194,8 +193,8 @@ def telegram_connector(node_names: List[str]) -> Tuple[pd.DataFrame, pd.DataFram
         return pd.DataFrame(), pd.DataFrame()
 
     def reduce_returns(
-        carry: Tuple[pd.DataFrame, pd.DataFrame],
-        value: Tuple[pd.DataFrame, pd.DataFrame],
+            carry: Tuple[pd.DataFrame, pd.DataFrame],
+            value: Tuple[pd.DataFrame, pd.DataFrame],
     ):
         return pd.concat([carry[0], value[0]]), pd.concat([carry[1], value[1]])
 
@@ -204,6 +203,6 @@ def telegram_connector(node_names: List[str]) -> Tuple[pd.DataFrame, pd.DataFram
 
     log.debug(f"TG Connector found: {_ret_}")
 
-    if len(_ret_) > 0:
-        return reduce(reduce_returns, _ret_)
-    return pd.DataFrame(), pd.DataFrame()
+    if len(_ret_) <= 0:
+        return pd.DataFrame(), pd.DataFrame()
+    return reduce(reduce_returns, _ret_)
