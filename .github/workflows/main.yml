@@ -2,7 +2,7 @@ name: ponyexpress_telegram pytests
 
 on:
   pull_request:
-    branches: ["trunk"]
+    branches: ["trunk", "main"]
 
 jobs:
   build:
