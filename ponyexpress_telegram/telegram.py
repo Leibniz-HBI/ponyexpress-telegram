@@ -6,12 +6,15 @@ ToDo:
 """
 
 from functools import reduce
-from typing import List, Optional, Tuple, Dict, Any, Callable
+from types import MappingProxyType
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 from loguru import logger as log
-from lxml import html, etree
+from lxml import etree, html
+
+from ponyexpress_telegram.utils import WaitTimed, cleanup, extract_from
 
 message_paths = {
     # pylint: disable=C0301
@@ -49,6 +52,9 @@ user_paths = {
 }
 
 
+allow_multiple = ["link", "image_url", "video_url"]
+
+
 def parse_tg_number_string(num: str) -> float:
     """parses the telegram number format"""
     if len(num) > 0:
@@ -58,32 +64,35 @@ def parse_tg_number_string(num: str) -> float:
     return 0.0
 
 
-def extract_from(tree, xpaths):
-    """extracts data from a lxml tree based on a dictionary of xpaths"""
-    return {name: tree.xpath(xpath) for name, xpath in xpaths.items()}
+common_rules = {
+    lambda key, value: isinstance(value, list)
+    and key not in allow_multiple: lambda x: "".join(x)
+    if len(x) > 0
+    else None,
+    lambda key, value: isinstance(value, str): lambda x: x.strip(),
+    lambda key, value: ("count" in key or "views" in key)
+    and value is not None: parse_tg_number_string,
+    lambda key, value: key == "datetime" and isinstance(value, str): pd.to_datetime,
+    lambda key, value: key == "datetime"
+    and isinstance(value, list): lambda x: pd.to_datetime(x[0]),
+}
+"""common rules for cleaning data"""
 
-
-def cleanup(data_dict: Dict[str, Any], rules: Dict[Callable, Callable]) -> Dict[str, Any]:
-    """Rule-based data cleaning.
-
-    Args:
-        data_dict: the data to be cleaned
-        rules: the rules to be applied, whereas a ruleset is a dictionary with predicates as keys
-            and cleaning functions as values. The predicate is a function that takes the key and
-            value of the data_dict and returns a boolean. If the predicate returns True, the
-            corresponding cleaning function is applied to the value.
-    Returns:
-        Dict[str, Any] : the cleaned data
-    """
-    return {
-        key: reduce(lambda _value, ruleset: ruleset[1](_value) if ruleset[0](key, _value) is
-        True else _value, rules.items(), value)
-        for key, value in data_dict.items()
+_default_configuration = MappingProxyType(
+    {
+        "timeout": 10,
+        "max_retries": 3,
+        "retry_delay": 5,
+        "wait_time": 4,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
+        "like Gecko) Chrome/80.0.3987.132 Safari/537.36",
     }
+)
+"""Immutable default configuration for the scraper."""
 
 
-def get_messages(page: etree.ElementTree) -> pd.DataFrame:
-    """get Telegram messages from a HTML document
+def get_messages(page: etree.ElementTree) -> pd.DataFrame:  # pylint: disable=I1101
+    """get Telegram messages from an HTML document
 
     Args:
       page: the parsed HTML document
@@ -96,12 +105,8 @@ def get_messages(page: etree.ElementTree) -> pd.DataFrame:
     base_xpath = "//div[@class='tgme_widget_message_bubble']"
     messages_html = page.xpath(base_xpath)
     rules = {
-        lambda key, value: key == "text": lambda x: "\n".join(x),
-        lambda key, value: key == "datetime": lambda x: pd.to_datetime(x[0]),
-        lambda key, value: "count" in key: lambda x: parse_tg_number_string(x[0]),
-        lambda key, value: key == "views": lambda x: parse_tg_number_string(x[0]),
-        lambda key, value: isinstance(value, list): lambda x: x[0] if len(x) > 0 else None,
-        lambda key, value: True: lambda x: x if x != "" else None,
+        **common_rules,
+        lambda key, value: key == "text" and isinstance(value, list): "\n".join,
     }
     try:
         data = [extract_from(_, message_paths) for _ in messages_html]
@@ -112,7 +117,10 @@ def get_messages(page: etree.ElementTree) -> pd.DataFrame:
     data = [cleanup(_, rules) for _ in data]
 
     data = pd.DataFrame(data)
-    data[["handle", "post_number"]] = data.post_id.str.split("/", n=1, expand=True)
+    if "post_id" in data.columns:
+        data[["handle", "post_number"]] = data.post_id.str.split("/", n=1, expand=True)
+    else:
+        log.warning(f"Could not extract post_id from {data.columns}")
     return data
 
 
@@ -127,9 +135,8 @@ def get_user(page) -> pd.DataFrame:
        keys of the user_paths-dictionary.
     """
     rules = {
-        lambda key, value: isinstance(value, list): lambda x: x[0] if len(x) > 0 else None,
+        **common_rules,
         lambda key, value: key == "name": lambda x: x.replace("@", ""),
-        lambda key, value: "count" in key: lambda x: parse_tg_number_string(x),
         lambda key, value: True: lambda x: x if x != "" else None,
     }
 
@@ -149,41 +156,60 @@ def get_user(page) -> pd.DataFrame:
     return data
 
 
-def get_node(node_name: str) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
-    visit_url = f"https://t.me/s/{node_name}"
-
-    resp = requests.get(visit_url)
-
-    log.debug(f"Visited node {node_name} with status: {resp.status_code}")
-
-    if resp.status_code != 200:
-        log.warning(f"{visit_url} did not succeed with status {resp.status_code}")
-
-        return pd.DataFrame(), pd.DataFrame([{"name": node_name, "handle": node_name}])
-
-    else:
-        html_source = html.fromstring(resp.content)
-        messages = get_messages(html_source)
-        nodes = get_user(html_source)
-
-        return messages, nodes
-
-
-def telegram_connector(node_names: List[str], configuration: Dict[str, Any]) -> Tuple[pd.DataFrame,
-pd.DataFrame]:
+def telegram_connector(
+    node_names: List[str], configuration: Dict[str, Any] = _default_configuration
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """for a list of handles scrape their public telegram channels
 
     That is, if there is a public channel present for the specified handles.
 
     Args:
       node_names:  list of handles to scrape
+      configuration:  configuration for the connector
 
     Returns:
-     edges, nodes in a Tuple[pd.DataFrame, pd.DataFrame].
+      edges, nodes in a Tuple[pd.DataFrame, pd.DataFrame].
     """
+
+    @WaitTimed(configuration.get("wait_time", 2))
+    def get_node(node_name: str) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
+        """Gets both message and user data for a given node.
+
+        Args:
+            node_name: the name of the node to scrape
+
+        Returns:
+            A tuple of the messages and user data as a ``pd.DataFrame``.
+        """
+        visit_url = f"https://t.me/s/{node_name}"
+
+        resp = requests.get(
+            visit_url,
+            timeout=configuration.get("timeout", 10),
+            headers={
+                "User-Agent": configuration.get("user_agent"),
+                **requests.utils.default_headers(),
+            },
+        )
+
+        log.debug(f"Visited node {node_name} with status: {resp.status_code}")
+
+        if resp.status_code != 200:
+            log.warning(f"{visit_url} did not succeed with status {resp.status_code}")
+
+            return pd.DataFrame(), pd.DataFrame(
+                [{"name": node_name, "handle": node_name}]
+            )
+
+        html_source = html.fromstring(resp.content)
+        messages = get_messages(html_source)
+        nodes = get_user(html_source)
+
+        return messages, nodes
+
     def _reduce_returns(
-            carry: Tuple[pd.DataFrame, pd.DataFrame],
-            value: Tuple[pd.DataFrame, pd.DataFrame],
+        carry: Tuple[pd.DataFrame, pd.DataFrame],
+        value: Tuple[pd.DataFrame, pd.DataFrame],
     ):
         return pd.concat([carry[0], value[0]]), pd.concat([carry[1], value[1]])
 
@@ -193,9 +219,7 @@ pd.DataFrame]:
         return pd.DataFrame(), pd.DataFrame()
     if configuration.get("prepare_edges", False):
         if len(_ret_[0]) > 0:
-            edges = _ret_[0].loc[
-                    ~_ret_[0]["forwarded_message_url"].isnull(), :
-                    ].copy()
+            edges = _ret_[0].loc[~_ret_[0]["forwarded_message_url"].isnull(), :].copy()
 
             if len(edges) > 0:
                 edges.loc[:, "source"] = edges.loc[:, "handle"]
